@@ -1,0 +1,65 @@
+# === My exclusions ===
+*.csv
+*.parquet
+InputData/
+
+# === OS files ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Conda / Python environments ===
+.conda/
+conda-meta/
+*.conda
+envs/
+env/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# === Jupyter Notebook ===
+.ipynb_checkpoints/
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Logs and temporary files ===
+*.log
+*.tmp
+*.bak
+*.cache
+
+# === Local config / secrets ===
+.env
+.env.local
+*.env
+secrets.yaml
+config.local.*
+
+# === Node.js dependencies (if relevant) ===
+node_modules/
+
+# === Build output ===
+build/
+dist/
+*.egg-info/
+
+# === Backup files ===
+*~
+
+# === ML models and checkpoints ===
+*.pt
+*.pth
+*.h5
+*.ckpt
+
+# === Other data formats to exclude ===
+*.pkl
+*.pickle
+*.xlsx
