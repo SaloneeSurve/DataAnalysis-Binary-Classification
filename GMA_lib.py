@@ -251,3 +251,181 @@ def train_test_split_by_annotation(df):
     )
 
     return train_df, test_df
+# ==================================================================
+# PREPROCESSING FROM HERE ON OUT(in line w the code above): trimming, missing values, band-pass filter, windowing, EDA
+# -- operating on the DataFrame returned by build_session_dataset(), whose
+# columns are: id, session, seconds_elapsed, accel_x/y/z, gyro_x/y/z,
+# gravity_x/y/z, type_device, id_device, annotation.
+#
+# Every step below groups by "session" so trimming/filtering/interpolation/
+# windowing never blends two different recordings together.
+# ==================================================================
+
+from scipy.signal import butter, filtfilt
+
+FS = 100.0  # nominal sampling rate
+
+ACCEL_COLS = ["accel_x", "accel_y", "accel_z"]
+GYRO_COLS = ["gyro_x", "gyro_y", "gyro_z"]
+GRAVITY_COLS = ["gravity_x", "gravity_y", "gravity_z"]
+ALL_SENSOR_COLS = ACCEL_COLS + GYRO_COLS + GRAVITY_COLS
+
+
+def trim_dataframe(df: pd.DataFrame, trim_start_sec: float = 0, trim_end_sec: float = 0,
+                    fs: float = FS, session_col: str = "session") -> pd.DataFrame:
+    """
+    in: dataframe (multi-session), seconds to trim from the front and back
+        of EACH session, sampling rate
+    out: trimmed dataframe (all sessions concatenated back together)
+    """
+    start_samples = int(trim_start_sec * fs)
+    end_samples = int(trim_end_sec * fs)
+
+    trimmed_sessions = []
+    for session_id, group in df.groupby(session_col, sort=False):
+        group = group.reset_index(drop=True)
+        if start_samples + end_samples >= len(group):
+            print(f"  WARNING: session {session_id} too short to trim ({len(group)} rows) — skipping.")
+            continue
+        trimmed = group.iloc[start_samples:-end_samples] if end_samples > 0 else group.iloc[start_samples:]
+        trimmed_sessions.append(trimmed)
+
+    result = pd.concat(trimmed_sessions, ignore_index=True)
+    print(f"Rows before trimming: {len(df)} -> after: {len(result)}")
+    return result
+
+
+def handle_missing_values(df: pd.DataFrame, columns: list = ALL_SENSOR_COLS,
+                           session_col: str = "session", strategy: str = "interpolate") -> pd.DataFrame:
+    """
+    in: dataframe, columns to check/fill, strategy ("interpolate"/"drop"/"ffill")
+    out: dataframe with missing values handled (per session, so interpolation
+         never pulls in a sample from a different recording)
+    """
+    total_missing_before = df[columns].isna().sum().sum()
+
+    filled_sessions = []
+    for session_id, group in df.groupby(session_col, sort=False):
+        group = group.copy()
+        if strategy == "interpolate":
+            group[columns] = group[columns].interpolate(method="linear", limit_direction="both")
+        elif strategy == "drop":
+            group = group.dropna(subset=columns)
+        elif strategy == "ffill":
+            group[columns] = group[columns].ffill().bfill()
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+        filled_sessions.append(group)
+
+    result = pd.concat(filled_sessions, ignore_index=True)
+    total_missing_after = result[columns].isna().sum().sum()
+    print(f"Missing values: {total_missing_before} -> {total_missing_after} (strategy={strategy})")
+    return result
+
+
+def apply_bandpass_filter(df: pd.DataFrame, columns: list = ALL_SENSOR_COLS,
+                           low_cutoff: float = 5.0, high_cutoff: float = 30.0,
+                           fs: float = FS, order: int = 4,
+                           session_col: str = "session") -> pd.DataFrame:
+    """
+    in: dataframe, columns to filter (defaults to accel+gyro+gravity,
+        matching G.ipynb), band cutoffs, sampling rate
+    out: dataframe with added *_filt columns, filtered per session
+    """
+    nyquist = fs / 2
+    low_norm = low_cutoff / nyquist
+    high_norm = min(high_cutoff, nyquist * 0.95) / nyquist
+    b, a = butter(order, [low_norm, high_norm], btype="band", analog=False)
+    padlen = 3 * (max(len(b), len(a)) - 1)
+
+    filtered_sessions = []
+    for session_id, group in df.groupby(session_col, sort=False):
+        group = group.copy()
+        if len(group) <= padlen:
+            print(f"  WARNING: session {session_id} too short to filter ({len(group)} rows) — keeping raw.")
+            for col in columns:
+                group[f"{col}_filt"] = group[col]
+        else:
+            for col in columns:
+                group[f"{col}_filt"] = filtfilt(b, a, group[col].values)
+        filtered_sessions.append(group)
+
+    return pd.concat(filtered_sessions, ignore_index=True)
+
+
+def windowing(df: pd.DataFrame, window_length: float, overlap_percentage: float,
+              fs: float = FS, session_col: str = "session"):
+    """
+    in: dataframe, window_length (seconds), overlap_percentage (0-100), fs
+    out: (number_of_windows, dataframe) -- long-format, with a 'window_id'
+         column (unique across the whole multi-session dataset), windowed
+         per session so a window never spans two different recordings
+    """
+    window_size = int(round(window_length * fs))
+    step_size = max(1, int(round(window_size * (1 - overlap_percentage / 100))))
+
+    window_frames = []
+    window_id = 0
+    for session_id, group in df.groupby(session_col, sort=False):
+        group = group.reset_index(drop=True)
+        n_samples = len(group)
+        start = 0
+        while start + window_size <= n_samples:
+            chunk = group.iloc[start:start + window_size].copy()
+            chunk["window_id"] = window_id
+            window_frames.append(chunk)
+            window_id += 1
+            start += step_size
+
+    if not window_frames:
+        return 0, pd.DataFrame(columns=list(df.columns) + ["window_id"])
+
+    return window_id, pd.concat(window_frames, ignore_index=True)
+
+
+def eda(df: pd.DataFrame, columns: list = ALL_SENSOR_COLS,
+        time_col: str = "seconds_elapsed", session_col: str = "session"):
+    """
+    in: dataframe, columns to summarize
+    out: none (prints summary stats + missing-value counts; plots one
+         example session's time series per column, plus a correlation
+         heatmap across all sessions combined)
+    """
+    print(df[columns].describe())
+    print("\nMissing values per column:")
+    print(df[columns].isna().sum())
+    print(f"\nSessions: {df[session_col].nunique()}")
+    print(f"Rows per session:\n{df.groupby(session_col).size()}")
+
+    example_session = df[session_col].iloc[0]
+    example_df = df[df[session_col] == example_session]
+
+    fig, axes = plt.subplots(len(columns), 1, figsize=(10, 2.0 * len(columns)), sharex=True)
+    for ax, col in zip(axes, columns):
+        ax.plot(example_df[time_col], example_df[col], linewidth=0.5)
+        ax.set_ylabel(col)
+    axes[0].set_title(f"session {example_session} (example)")
+    axes[-1].set_xlabel(time_col)
+    plt.tight_layout()
+    plt.show()
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    corr = df[columns].corr()
+    im = ax.imshow(corr, vmin=-1, vmax=1, cmap="coolwarm")
+    ax.set_xticks(range(len(columns))); ax.set_yticks(range(len(columns)))
+    ax.set_xticklabels(columns, rotation=90); ax.set_yticklabels(columns)
+    fig.colorbar(im)
+    ax.set_title("correlation matrix (all sessions combined)")
+    plt.tight_layout()
+    plt.show()
+
+
+# ------------------------------------------------------------------
+# Example flow, continuing straight from build_session_dataset()
+# ------------------------------------------------------------------
+# dataset_df = build_session_dataset(input_path=DATASET_PATH, save_csv=True)
+# df_trimmed  = trim_dataframe(dataset_df, trim_start_sec=3.0, trim_end_sec=3.0, fs=FS)
+# df_clean    = handle_missing_values(df_trimmed)
+# df_filtered = apply_bandpass_filter(df_clean)
+# n_windows, windowed_df = windowing(df_filtered, window_length=1.0, overlap_percentage=80, fs=FS)
+# eda(df_filtered)
