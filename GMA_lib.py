@@ -429,3 +429,172 @@ def eda(df: pd.DataFrame, columns: list = ALL_SENSOR_COLS,
 # df_filtered = apply_bandpass_filter(df_clean)
 # n_windows, windowed_df = windowing(df_filtered, window_length=1.0, overlap_percentage=80, fs=FS)
 # eda(df_filtered)
+
+
+# ==================================================================
+# FEATURE EXTRACTION & FEATURE SELECTION FROM HERE ON OUT:
+# -- operating on the DataFrame returned by windowing()
+# ==================================================================
+
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import stats
+from scipy.fft import rfft, rfftfreq
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+
+def extract_features(windowed_df: pd.DataFrame, fs: float = FS) -> pd.DataFrame:
+    """
+    in: dataframe (windowed sensor data), sampling rate (fs)
+    out: dataframe with extracted time-domain and frequency-domain (FFT) features,
+         retaining 'window_id' and 'session' columns
+    """
+    print("\n--- 6. Feature Extraction (5ARE0 Course Pipeline) ---")
+
+    # 1. Compute magnitudes and vertical acceleration (orientation-invariant)
+    accel_cols = ["accel_x_filt", "accel_y_filt", "accel_z_filt"]
+    gyro_cols = ["gyro_x_filt", "gyro_y_filt", "gyro_z_filt"]
+    grav_cols = ["gravity_x", "gravity_y", "gravity_z"]
+
+    windowed_df = windowed_df.copy()
+    windowed_df["accel_mag"] = np.sqrt((windowed_df[accel_cols] ** 2).sum(axis=1))
+    windowed_df["gyro_mag"] = np.sqrt((windowed_df[gyro_cols] ** 2).sum(axis=1))
+
+    # Pure vertical component: projection onto gravity vector
+    dot_p = (
+        windowed_df["accel_x_filt"] * windowed_df["gravity_x"]
+        + windowed_df["accel_y_filt"] * windowed_df["gravity_y"]
+        + windowed_df["accel_z_filt"] * windowed_df["gravity_z"]
+    )
+    grav_mag = np.sqrt((windowed_df[grav_cols] ** 2).sum(axis=1))
+    windowed_df["accel_vert"] = dot_p / np.where(grav_mag == 0, 1.0, grav_mag)
+
+    # 2. Vectorized feature extraction per window_id
+    signals = ["accel_mag", "gyro_mag", "accel_vert"]
+    grouped = windowed_df.groupby("window_id", sort=True)
+
+    feature_dict = {
+        "window_id": grouped["window_id"].first(),
+        "session": grouped["session"].first(),
+    }
+
+    # Time-Domain features
+    for s in signals:
+        feature_dict[f"{s}_mean"] = grouped[s].mean()
+        feature_dict[f"{s}_std"] = grouped[s].std()
+        feature_dict[f"{s}_min"] = grouped[s].min()
+        feature_dict[f"{s}_max"] = grouped[s].max()
+        feature_dict[f"{s}_rms"] = np.sqrt(grouped[s].apply(lambda x: np.mean(x**2)))
+        feature_dict[f"{s}_ptp"] = feature_dict[f"{s}_max"] - feature_dict[f"{s}_min"]
+        feature_dict[f"{s}_kurtosis"] = grouped[s].apply(lambda x: stats.kurtosis(x))
+        feature_dict[f"{s}_skew"] = grouped[s].apply(lambda x: stats.skew(x))
+
+    # 3. Frequency-Domain (FFT) features on accel_vert
+    def extract_fft_features(series):
+        x = series.values
+        n_samples = len(x)
+        if n_samples < 2:
+            return pd.Series([0.0, 0.0], index=["dom_freq", "vibr_energy"])
+
+        x_centered = x - np.mean(x)
+        yf = np.abs(rfft(x_centered)) * (2.0 / n_samples)
+        xf = rfftfreq(n_samples, 1.0 / fs)
+
+        dom_freq = xf[np.argmax(yf)] if len(yf) > 0 else 0.0
+        mask = (xf >= 5.0) & (xf <= 30.0)
+        vibr_energy = np.sum(yf[mask] ** 2) if np.any(mask) else 0.0
+
+        return pd.Series([dom_freq, vibr_energy], index=["dom_freq", "vibr_energy"])
+
+    fft_feats = grouped["accel_vert"].apply(extract_fft_features).unstack()
+    feature_dict["accel_vert_dom_freq"] = fft_feats["dom_freq"]
+    feature_dict["accel_vert_vibr_energy"] = fft_feats["vibr_energy"]
+
+    x_all = pd.DataFrame(feature_dict).reset_index(drop=True)
+    print(f"Extracted {x_all.shape[0]} windows with {x_all.shape[1] - 2} features each.")
+    print(x_all.head())
+
+    return x_all
+
+
+def select_features_and_pca(x_all: pd.DataFrame, variance_threshold: float = 0.95,
+                            output_path=None, save_csv: bool = True) -> pd.DataFrame:
+    """
+    in: dataframe (extracted features), variance_threshold (float), optional output_path,
+        save_csv flag
+    out: dataframe with principal components (PC_1, PC_2, ...) explaining the target
+         cumulative variance, plus 'window_id' and 'session' columns
+    """
+    print("\n--- 7. Feature Selection: Correlation & PCA ---")
+    output_path = Path(output_path) if output_path else Path("OutputData")
+
+    feature_cols = [c for c in x_all.columns if c not in ["window_id", "session"]]
+    x = x_all[feature_cols].copy()
+    x = x.replace([np.inf, -np.inf], np.nan).fillna(x.mean())
+
+    # Step 1: Multicollinearity filtering (Pearson correlation > 0.90)
+    corr_matrix = x.corr().abs()
+    upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    cols_to_drop = [col for col in upper_tri.columns if any(upper_tri[col] > 0.90)]
+
+    x_uncorr = x.drop(columns=cols_to_drop)
+    print(f"Original Features: {x.shape[1]}")
+    print(f"Features after correlation filter (r < 0.90): {x_uncorr.shape[1]}")
+    print(f"Dropped as redundant: {cols_to_drop}")
+
+    # Step 2: Standardization & PCA
+    scaler = StandardScaler()
+    x_scaled = scaler.fit_transform(x_uncorr)
+
+    pca = PCA(n_components=variance_threshold, random_state=42)
+    x_pca = pca.fit_transform(x_scaled)
+
+    print(f"\n[PCA] Dimensions reduced to {pca.n_components_} principal components.")
+    print(f"Total Explained Variance: {np.sum(pca.explained_variance_ratio_):.2%}")
+
+    # Scree Plot
+    plt.figure(figsize=(8, 4))
+    plt.plot(
+        range(1, pca.n_components_ + 1),
+        np.cumsum(pca.explained_variance_ratio_),
+        marker="o",
+        color="navy",
+    )
+    plt.axhline(
+        y=variance_threshold,
+        color="r",
+        linestyle="--",
+        label=f"{int(variance_threshold * 100)}% Explained Variance",
+    )
+    plt.xlabel("Number of Principal Components")
+    plt.ylabel("Cumulative Variance")
+    plt.title("PCA Explained Variance Ratio (Session 4)")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    df_pca = pd.DataFrame(x_pca, columns=[f"PC_{i+1}" for i in range(pca.n_components_)])
+    df_pca["window_id"] = x_all["window_id"]
+    df_pca["session"] = x_all["session"]
+
+    if save_csv:
+        output_path.mkdir(parents=True, exist_ok=True)
+        x_all.to_csv(output_path / "extracted_features.csv", index=False)
+        print(f"Saved: {output_path / 'extracted_features.csv'}")
+
+        df_pca.to_csv(output_path / "X_selected_pca.csv", index=False)
+        print(f"Saved: {output_path / 'X_selected_pca.csv'}")
+
+    return df_pca
+
+
+# ------------------------------------------------------------------
+# Example flow, continuing straight from windowing()
+# ------------------------------------------------------------------
+# x_all  = extract_features(windowed_df, fs=FS)
+# df_pca = select_features_and_pca(x_all, variance_threshold=0.95, output_path=OUTPUT_PATH, save_csv=True)
